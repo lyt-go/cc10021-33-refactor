@@ -12,6 +12,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.profile_standardization import (
+    PROFILE_SOURCE_REGISTRATION,
+    upsert_profile_record,
+)
 from app.store import store
 
 
@@ -89,25 +93,21 @@ class TableCatalogService(BaseModuleService):
         return issues
 
     def _dispatch_column_profile(self, table_id: int, table_name: str, columns: list[dict]) -> int:
-        """将字段信息写入画像计算流水线，驱动字段画像计算。"""
+        """将字段信息写入画像计算流水线，驱动字段画像计算。
+
+        登记初值与样本计算入口共用同一套字段画像标准化写法；按
+        (关联表名, 字段名称) 收拢，登记中断重试时不会重复建档，
+        也不会把已到达的真实样本结果记回初始化值。
+        """
         profile_rows = store.rows("column_profile")
         dispatched = 0
         for col in columns:
-            new_pid = max((int(r.get("id", 0)) for r in profile_rows), default=0) + 1
-            profile_rows.append({
-                "id": new_pid,
-                "画像编号": f"COLU-{new_pid:04d}",
-                "关联表名": table_name,
-                "字段名称": col.get("字段名称", ""),
-                "空值比例": "0.00%",
-                "唯一值数": "待计算",
-                "最小值": "待计算",
-                "最大值": "待计算",
-                "画像版本": "v1.0",
-                "status": "计算中",
-                "pending": True,
-                "abnormal": False,
-            })
+            upsert_profile_record(
+                profile_rows,
+                table_name,
+                col.get("字段名称", ""),
+                source=PROFILE_SOURCE_REGISTRATION,
+            )
             dispatched += 1
         return dispatched
 

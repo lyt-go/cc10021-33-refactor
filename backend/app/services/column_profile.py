@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.profile_standardization import (
+    PROFILE_SOURCE_SAMPLE,
+    find_profile_record,
+    profile_source_of,
+    upsert_profile_record,
+)
 from app.store import store
 
 
@@ -78,6 +84,21 @@ class ColumnProfileService(BaseModuleService):
                 profile["均值"] = "N/A"
                 profile["质量评分"] = round(85.0 + random.uniform(-10, 15), 2)
 
+            # 样本指标同步生成字段画像记录，与目录登记入口共用同一套标准化
+            # 写法：真实计算值（含真实零值）原样落档，替换同字段的登记初值
+            upsert_profile_record(
+                store.rows(self.MODULE),
+                table_name,
+                col_name,
+                metrics={
+                    "空值比例": null_pct,
+                    "唯一值数": unique_count,
+                    "最小值": profile["最小值"],
+                    "最大值": profile["最大值"],
+                },
+                source=PROFILE_SOURCE_SAMPLE,
+            )
+
             results.append(profile)
         return results
 
@@ -85,7 +106,8 @@ class ColumnProfileService(BaseModuleService):
         """聚合表中所有字段画像为表级质量快照。
 
         聚合各字段的空值比例、唯一值数和质量评分，生成表级数据质量概览。
-        同时将聚合后的画像快照关联到质量基线服务。
+        同时将聚合后的画像快照按原口径同步到质量基线校对清单，并记录
+        实际采用的字段画像记录，供核验回溯。
         """
         if not column_profiles:
             return {"表名称": table_name, "状态": "无字段画像数据"}
@@ -94,6 +116,9 @@ class ColumnProfileService(BaseModuleService):
             float(cp.get("空值比例", "0%").rstrip("%")) for cp in column_profiles
         ) / len(column_profiles)
         avg_quality = sum(cp.get("质量评分", 0) for cp in column_profiles) / len(column_profiles)
+
+        # 定位本次基线实际采用的字段画像记录（收拢后的记录为准）
+        adopted_refs, adopted_origin = self._adopted_profile_refs(table_name, column_profiles)
 
         # 聚合后的画像快照写入质量基线
         baseline_rows = store.rows("dq_baseline")
@@ -108,6 +133,8 @@ class ColumnProfileService(BaseModuleService):
             "计算周期": "每日",
             "基准日期": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "基线版本": "v1",
+            "来源画像": adopted_refs,
+            "画像来源": adopted_origin,
             "status": "已生效",
             "pending": False,
             "abnormal": avg_quality < 60,
@@ -121,6 +148,25 @@ class ColumnProfileService(BaseModuleService):
             "基线已建立": True,
             "聚合时间": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _adopted_profile_refs(self, table_name: str, column_profiles: list[dict]) -> tuple[list[str], str]:
+        """定位基线实际采用的字段画像记录，供基线校对清单回溯来源。"""
+        profile_rows = store.rows(self.MODULE)
+        refs: list[str] = []
+        sources: list[str] = []
+        for cp in column_profiles:
+            record = find_profile_record(profile_rows, table_name, cp.get("字段名称", ""))
+            if record is None:
+                continue
+            refs.append(str(record.get("画像编号")))
+            sources.append(profile_source_of(record))
+        if not sources:
+            origin = "未入库"
+        elif len(set(sources)) == 1:
+            origin = sources[0]
+        else:
+            origin = "混合"
+        return refs, origin
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()
